@@ -1,0 +1,8 @@
+# heslo k WiFi
+src/secrets.h
+
+# zaloha tovarniho firmwaru (4 MB binarka vyrobce)
+zaloha/
+
+.pio/
+.vscode/
