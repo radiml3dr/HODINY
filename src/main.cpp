@@ -27,6 +27,8 @@ Countdown countdown;
 Mode mode = Mode::Timer;
 int64_t lastActivityAt = 0;  // posledni stisk nebo zmena rezimu, pro navrat na hodiny
 int64_t lastBusyAt = 0;      // posledni stisk nebo bezici mereni, pro samocinne vypnuti
+bool autoOffEnabled = true;  // setreni jde zrusit na obrazovce VYPNOUT; plati do restartu
+int64_t pendingOffAt = 0;    // klik na VYPNOUT ceka, jestli z nej nebude dvojklik
 bool showInfo = false;
 bool rotated = false;
 DigitFont digitFont = DigitFont::Latin;
@@ -93,6 +95,7 @@ void nextPreset() {
 void setMode(Mode m) {
   mode = m;
   showInfo = false;
+  pendingOffAt = 0;
   lastActivityAt = nowMs();
   ui.clear();
 }
@@ -153,6 +156,15 @@ void powerOff() {
 }
 
 void autoPowerOff(int64_t now) {
+  if (pendingOffAt && now >= pendingOffAt) {
+    if (digitalRead(PIN_BUTTON) == LOW) {
+      pendingOffAt = now + 100;  // druhy stisk jeste trva, pockam na dvojklik
+    } else {
+      pendingOffAt = 0;
+      if (mode == Mode::Off) powerOff();
+    }
+  }
+  if (!autoOffEnabled) return;
   if (countdown.running || stopwatch.running || alarmOn) lastBusyAt = now;
   if (now - lastBusyAt < AUTO_OFF_MS) return;
   if (HWCDC::isPlugged()) {
@@ -186,7 +198,13 @@ void onButton(BtnEvent ev, int64_t at) {
   }
   switch (mode) {
     case Mode::Off:
-      if (ev == BtnEvent::Click) powerOff();
+      if (ev == BtnEvent::Click) {
+        pendingOffAt = nowMs() + 500;
+      } else {
+        autoOffEnabled = !autoOffEnabled;
+        Serial.printf("[spanek] setreni %s\n", autoOffEnabled ? "zapnuto" : "zruseno");
+        setMode(Mode::Clock);
+      }
       break;
 
     case Mode::Font:
@@ -240,7 +258,7 @@ void drawInfo() {
 }
 
 void drawClock() {
-  ui.header("HODINY", color::CLOCK, wifiOn ? "WiFi" : "", color::TIMER);
+  ui.header("HODINY", color::CLOCK, wifiOn ? "WiFi" : autoOffEnabled ? "" : "NESPIM", color::TIMER);
   ui.progress(-1, color::CLOCK);
 
   struct tm t;
@@ -328,8 +346,9 @@ void drawFont() {
 void drawOff() {
   ui.header("VYPNOUT", color::ALARM, clockText(), color::TEXT);
   ui.textLine(1, "klik = vypnout", color::TEXT);
-  ui.textLine(3, "zapnuti: stisk tlacitka", color::DIM);
-  ui.textLine(5, "drzet = zpet na hodiny", color::DIM);
+  ui.textLine(2, "zapnuti: stisk tlacitka", color::DIM);
+  ui.textLine(4, autoOffEnabled ? "2x = zrusit setreni" : "2x = zapnout setreni", color::TEXT);
+  ui.textLine(5, autoOffEnabled ? "vypne se po 10 min" : "samo se nevypne", color::DIM);
 }
 
 void draw(int64_t now) {
@@ -415,11 +434,11 @@ void printStatus(int64_t now) {
   struct tm t;
   char clock[20] = "nenastaven";
   if (localNow(t)) strftime(clock, sizeof(clock), "%H:%M:%S", &t);
-  Serial.printf("[stav] beh=%llds reset=%d pismo=%d rezim=%s cas=%s stopky=%lld ms%s minutka=%lld/%lld ms%s wifi=%s sync=%d heap=%u\n",
+  Serial.printf("[stav] beh=%llds reset=%d pismo=%d rezim=%s cas=%s stopky=%lld ms%s minutka=%lld/%lld ms%s wifi=%s sync=%d setreni=%d heap=%u\n",
                 now / 1000, (int)esp_reset_reason(), (int)digitFont, MODES[(int)mode], clock, stopwatch.elapsed(now),
                 stopwatch.running ? " (bezi)" : "", countdown.remaining(now), countdown.totalMs,
                 alarmOn ? " (ALARM)" : countdown.running ? " (bezi)" : "",
-                wifiOn ? "zap" : "vyp", everSynced,
+                wifiOn ? "zap" : "vyp", everSynced, autoOffEnabled,
                 (unsigned)ESP.getFreeHeap());
 }
 

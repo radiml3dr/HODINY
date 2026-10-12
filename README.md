@@ -14,7 +14,7 @@ Vše se ovládá jediným tlačítkem **BOOT**.
 | Hodiny | stránka se stavem sítě | – |
 | Písmo | další písmo číslic: Latin → Klingon → Predator → Japan | – |
 
-| Vypnout | uspí hodiny (displej, podsvícení i WiFi zhasnou) | – |
+| Vypnout | uspí hodiny (displej, podsvícení i WiFi zhasnou) | zruší / zapne samočinné vypínání a přepne na hodiny |
 
 - **Podržení** (0,7 s) přepíná režimy: hodiny → stopky → minutka → písmo → vypnout.
 - **Šetření baterie:** po 10 minutách bez stisku, když neběží minutka ani stopky, se hodiny uspí samy.
