@@ -2,10 +2,10 @@
 // Ovladani jednim tlacitkem BOOT: klik, dvojklik, podrzeni (dalsi rezim).
 
 #include <Arduino.h>
-#include <ESPmDNS.h>
 #include <Preferences.h>
-#include <WebServer.h>
 #include <WiFi.h>
+#include <driver/gpio.h>
+#include <esp_sleep.h>
 #include <esp_sntp.h>
 #include <sys/time.h>
 
@@ -16,19 +16,20 @@
 
 namespace {
 
-enum class Mode { Clock, Stopwatch, Timer };
+enum class Mode { Clock, Stopwatch, Timer, Font, Off };
 
 Ui ui;
 Button button;
 Preferences prefs;
-WebServer server(80);
 Stopwatch stopwatch;
 Countdown countdown;
 
 Mode mode = Mode::Timer;
 int64_t lastActivityAt = 0;  // posledni stisk nebo zmena rezimu, pro navrat na hodiny
+int64_t lastBusyAt = 0;      // posledni stisk nebo bezici mereni, pro samocinne vypnuti
 bool showInfo = false;
 bool rotated = false;
+DigitFont digitFont = DigitFont::Latin;
 
 // stav pred prvnim klikem, aby dvojklik vedel, co prvni klik zmenil
 bool stopwatchRanBeforeClick = false;
@@ -40,12 +41,12 @@ int64_t alarmStartedAt = 0;
 
 const String cfgSsid = WIFI_SSID;
 const String cfgPass = WIFI_PASS;
-bool apOn = false;
-bool staWasConnected = false;
-bool mdnsStarted = false;
-int64_t staAttemptAt = 0;
+bool wifiOn = false;
+bool sntpStarted = false;
+bool everSynced = false;
+int64_t wifiStartedAt = 0;
+int64_t nextSyncAt = 0;
 volatile bool ntpSynced = false;
-bool browserTimeSet = false;
 
 const char *const DAYS[] = {"NEDELE", "PONDELI", "UTERY", "STREDA", "CTVRTEK", "PATEK", "SOBOTA"};
 
@@ -129,16 +130,50 @@ void updateAlarm(int64_t now) {
 
 // ---------------------------------------------------------------- tlacitko
 
+// "Vypnuti" je lehky spanek: displej, podsviceni i WiFi zhasnou a procesor stoji, dokud nekdo
+// nestiskne tlacitko. Hluboky spanek by setril vic, ale tlacitko BOOT (GPIO9) z nej budit neumi.
+// Po probuzeni se hodiny restartuji, takze nabehnou stejne jako po zapnuti.
+void powerOff() {
+  Serial.println("[spanek] vypinam, probudi stisk tlacitka");
+  delay(50);
+  stopAlarm();
+  rgbLedWrite(PIN_LED, 0, 0, 0);
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  ui.sleep();
+
+  while (digitalRead(PIN_BUTTON) == LOW) delay(10);
+  gpio_wakeup_enable((gpio_num_t)PIN_BUTTON, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+  esp_light_sleep_start();
+
+  // restart az po pusteni: GPIO9 zaroven pri resetu voli rezim nahravani
+  while (digitalRead(PIN_BUTTON) == LOW) delay(10);
+  esp_restart();
+}
+
+void autoPowerOff(int64_t now) {
+  if (countdown.running || stopwatch.running || alarmOn) lastBusyAt = now;
+  if (now - lastBusyAt < AUTO_OFF_MS) return;
+  if (HWCDC::isPlugged()) {
+    // u pocitace se nevypina; odklad, at se stav USB necte v kazdem pruchodu smycky
+    lastBusyAt = now - AUTO_OFF_MS + 10000;
+    return;
+  }
+  powerOff();
+}
+
 // Minutka, ktera neodpocitava, a stojici stopky po chvili necinnosti uvolni displej hodinam
 void autoReturnToClock(int64_t now) {
   int64_t idle = now - lastActivityAt;
   bool timerIdle = mode == Mode::Timer && !countdown.running && !alarmOn && idle >= TIMER_IDLE_RETURN_MS;
   bool stopwatchIdle = mode == Mode::Stopwatch && !stopwatch.running && idle >= STOPWATCH_IDLE_RETURN_MS;
-  if (timerIdle || stopwatchIdle) setMode(Mode::Clock);
+  bool fontIdle = (mode == Mode::Font || mode == Mode::Off) && idle >= TIMER_IDLE_RETURN_MS;
+  if (timerIdle || stopwatchIdle || fontIdle) setMode(Mode::Clock);
 }
 
 void onButton(BtnEvent ev, int64_t at) {
-  lastActivityAt = nowMs();
+  lastActivityAt = lastBusyAt = nowMs();
   if (alarmOn) {
     stopAlarm();
     countdown.reset();
@@ -146,10 +181,22 @@ void onButton(BtnEvent ev, int64_t at) {
     return;
   }
   if (ev == BtnEvent::LongPress) {
-    setMode(mode == Mode::Clock ? Mode::Stopwatch : mode == Mode::Stopwatch ? Mode::Timer : Mode::Clock);
+    setMode(mode == Mode::Clock ? Mode::Stopwatch : mode == Mode::Stopwatch ? Mode::Timer : mode == Mode::Timer ? Mode::Font : mode == Mode::Font ? Mode::Off : Mode::Clock);
     return;
   }
   switch (mode) {
+    case Mode::Off:
+      if (ev == BtnEvent::Click) powerOff();
+      break;
+
+    case Mode::Font:
+      if (ev == BtnEvent::Click) {
+        // pismo se neuklada, po resetu je vzdy Latin
+        digitFont = (DigitFont)(((uint8_t)digitFont + 1) % DIGIT_FONT_COUNT);
+        ui.setFont(digitFont);
+      }
+      break;
+
     case Mode::Clock:
       if (ev == BtnEvent::Click) {
         showInfo = !showInfo;
@@ -184,20 +231,16 @@ void onButton(BtnEvent ev, int64_t at) {
 // ---------------------------------------------------------------- kresleni
 
 void drawInfo() {
-  bool connected = WiFi.status() == WL_CONNECTED;
-  ui.header("NASTAVENI", color::TEXT, "", color::TEXT);
+  ui.header("SIT", color::TEXT, "", color::TEXT);
   ui.textLine(0, "WiFi: " + cfgSsid, color::TEXT);
-  ui.textLine(1, "IP:   " + (connected ? WiFi.localIP().toString() : String("nepripojeno")), color::TEXT);
-  ui.textLine(2, apOn ? String("AP:   ") + AP_SSID : String("AP:   vypnuto"), color::TIMER);
-  ui.textLine(3, apOn ? String("heslo ") + AP_PASS : String(""), color::TIMER);
-  ui.textLine(4, apOn ? "web:  " + WiFi.softAPIP().toString() : String(""), color::TIMER);
-  ui.textLine(5, ntpSynced ? "cas:  z internetu" : browserTimeSet ? "cas:  z prohlizece" : "cas:  nenastaven", color::TEXT);
+  ui.textLine(1, wifiOn ? "stav: hledam cas..." : "stav: vypnuta, setrim", color::TEXT);
+  // po probuzeni ze spanku cas bezi dal i bez nove synchronizace
+  ui.textLine(2, everSynced ? "cas:  z internetu" : timeValid() ? "cas:  z minula" : "cas:  nenastaven", color::TEXT);
   ui.textLine(6, "klik zpet, drzet rezim", color::DIM);
 }
 
 void drawClock() {
-  bool connected = WiFi.status() == WL_CONNECTED;
-  ui.header("HODINY", color::CLOCK, connected ? "WiFi" : apOn ? "AP" : "...", connected ? color::STOPWATCH : color::TIMER);
+  ui.header("HODINY", color::CLOCK, wifiOn ? "WiFi" : "", color::TIMER);
   ui.progress(-1, color::CLOCK);
 
   struct tm t;
@@ -205,7 +248,7 @@ void drawClock() {
     const int8_t dashes[4] = {DIGIT_DASH, DIGIT_DASH, DIGIT_DASH, DIGIT_DASH};
     const int8_t blank[2] = {DIGIT_BLANK, DIGIT_BLANK};
     ui.digits(dashes, true, blank, false, color::CLOCK);
-    ui.subText("neznam cas - klikni", color::TEXT);
+    ui.subText(wifiOn ? "cekam na cas z WiFi" : "WiFi nedostupna", color::TEXT);
     return;
   }
   struct timeval tv;
@@ -271,8 +314,28 @@ void drawTimer(int64_t now) {
   }
 }
 
+// Vyber pisma cislic; ukazka ma stejne rozlozeni jako hodiny
+void drawFont() {
+  static const char *const NAMES[DIGIT_FONT_COUNT] = {"LATIN", "KLINGON", "PREDATOR", "JAPAN"};
+  ui.header("PISMO", color::TEXT, clockText(), color::TEXT);
+  ui.progress(-1, color::CLOCK);
+  const int8_t big[4] = {1, 2, 3, 4};
+  const int8_t small[2] = {5, 6};
+  ui.digits(big, true, small, false, color::CLOCK);
+  ui.subText(String(NAMES[(uint8_t)digitFont]) + "  klik = dalsi", color::TEXT);
+}
+
+void drawOff() {
+  ui.header("VYPNOUT", color::ALARM, clockText(), color::TEXT);
+  ui.textLine(1, "klik = vypnout", color::TEXT);
+  ui.textLine(3, "zapnuti: stisk tlacitka", color::DIM);
+  ui.textLine(5, "drzet = zpet na hodiny", color::DIM);
+}
+
 void draw(int64_t now) {
   switch (mode) {
+    case Mode::Off: drawOff(); break;
+    case Mode::Font: drawFont(); break;
     case Mode::Clock:
       if (showInfo) drawInfo();
       else drawClock();
@@ -284,168 +347,51 @@ void draw(int64_t now) {
 
 // ---------------------------------------------------------------- sit
 
+// WiFi slouzi jen k nastaveni casu: zapne se, pocka na NTP a zase se vypne, aby nezrala baterii.
+
 void onNtpSync(struct timeval *) { ntpSynced = true; }
 
-void startSta(int64_t now) {
-  staAttemptAt = now;
+void wifiStart(int64_t now) {
+  ntpSynced = false;
+  sntpStarted = false;
+  wifiOn = true;
+  wifiStartedAt = now;
+  WiFi.mode(WIFI_STA);
   WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
-  Serial.printf("[wifi] pripojuji se k '%s'\n", cfgSsid.c_str());
+  Serial.printf("[wifi] zapinam, pripojuji se k '%s'\n", cfgSsid.c_str());
 }
 
-void startAp() {
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP(AP_SSID, AP_PASS);
-  // trvale hledani site by rusilo vlastni AP, proto dal zkousim jen obcas rucne
-  WiFi.setAutoReconnect(false);
-  apOn = true;
-  Serial.printf("[wifi] AP '%s' zapnuto, web http://%s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
-}
-
-void stopAp() {
-  WiFi.softAPdisconnect(true);
-  apOn = false;
-  Serial.println("[wifi] AP vypnuto");
+void wifiStop(int64_t now, bool synced) {
+  if (esp_sntp_enabled()) esp_sntp_stop();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  wifiOn = false;
+  nextSyncAt = now + (synced ? NTP_RESYNC_MS : NTP_RETRY_MS);
+  Serial.printf("[wifi] vypinam, cas %s\n", synced ? "nastaven z internetu" : "se nepodarilo ziskat");
 }
 
 void netBegin(int64_t now) {
   WiFi.persistent(false);
   WiFi.setHostname(HOSTNAME);
-  WiFi.mode(WIFI_STA);
   sntp_set_time_sync_notification_cb(onNtpSync);
-  startSta(now);
+  wifiStart(now);
 }
 
 void netLoop(int64_t now) {
-  bool connected = WiFi.status() == WL_CONNECTED;
-  if (connected && !staWasConnected) {
-    Serial.printf("[wifi] pripojeno, web http://%s\n", WiFi.localIP().toString().c_str());
-    WiFi.setAutoReconnect(true);
+  if (!wifiOn) {
+    if (now >= nextSyncAt) wifiStart(now);
+    return;
+  }
+  if (!sntpStarted && WiFi.status() == WL_CONNECTED) {
     configTzTime(TIMEZONE, NTP_SERVER_1, NTP_SERVER_2);
-    if (!mdnsStarted && MDNS.begin(HOSTNAME)) {
-      MDNS.addService("http", "tcp", 80);
-      mdnsStarted = true;
-    }
+    sntpStarted = true;
   }
-  if (!connected && staWasConnected) staAttemptAt = now;
-  staWasConnected = connected;
-
-  if (connected) {
-    // AP nechavam, dokud je na nem nekdo pripojeny (treba prave nastavuje WiFi)
-    if (apOn && WiFi.softAPgetStationNum() == 0) stopAp();
-    return;
+  if (ntpSynced) {
+    everSynced = true;
+    wifiStop(now, true);
+  } else if (now - wifiStartedAt > NTP_TIMEOUT_MS) {
+    wifiStop(now, false);
   }
-  if (!apOn) {
-    if (now - staAttemptAt > 20000) startAp();
-  } else if (now - staAttemptAt > 60000 && WiFi.softAPgetStationNum() == 0) {
-    startSta(now);
-  }
-}
-
-// ---------------------------------------------------------------- web
-
-String htmlEscape(const String &s) {
-  String out;
-  out.reserve(s.length());
-  for (char c : s) {
-    switch (c) {
-      case '&': out += "&amp;"; break;
-      case '<': out += "&lt;"; break;
-      case '>': out += "&gt;"; break;
-      case '"': out += "&quot;"; break;
-      default: out += c;
-    }
-  }
-  return out;
-}
-
-void sendPage(const String &notice = "") {
-  bool connected = WiFi.status() == WL_CONNECTED;
-  String timeInfo = "není nastaven";
-  struct tm t;
-  if (localNow(t)) {
-    char buf[40];
-    strftime(buf, sizeof(buf), "%d.%m.%Y %H:%M:%S", &t);
-    timeInfo = String(buf) + (ntpSynced ? " (z internetu)" : " (z prohlížeče)");
-  }
-  String net = connected ? "připojeno k síti " + htmlEscape(cfgSsid) + ", adresa " + WiFi.localIP().toString()
-                         : "nepřipojeno k síti " + htmlEscape(cfgSsid);
-  uint32_t totalSec = countdown.totalMs / 1000;
-
-  String page;
-  page.reserve(3200);
-  page += F("<!doctype html><html lang=cs><meta charset=utf-8>"
-            "<meta name=viewport content='width=device-width,initial-scale=1'><title>Hodiny</title>"
-            "<style>body{font-family:system-ui,sans-serif;max-width:26em;margin:1em auto;padding:0 1em;"
-            "background:#111;color:#ddd}h1{color:#7df}h2{margin-top:1.6em;font-size:1.1em;color:#fb4}"
-            "input,button{font-size:1em;padding:.45em;margin:.2em 0;border-radius:.3em;border:1px solid #555;"
-            "background:#222;color:#eee}input[type=number]{width:4.5em}button{background:#246;cursor:pointer}"
-            ".n{background:#243;padding:.6em;border-radius:.3em}label{display:block;margin-top:.4em}</style>"
-            "<h1>Hodiny</h1>");
-  if (!notice.isEmpty()) page += "<p class=n>" + notice + "</p>";
-  page += "<p>Čas: <b>" + timeInfo + "</b></p>";
-  if (!ntpSynced) page += F("<button onclick='st()'>Nastavit čas podle tohoto zařízení</button>");
-
-  page += F("<h2>Minutka</h2><form method=post action=/timer>"
-            "<input type=number name=m min=0 max=99 value=");
-  page += totalSec / 60;
-  page += F("> min <input type=number name=s min=0 max=59 value=");
-  page += totalSec % 60;
-  page += F("> s<br><button name=go value=0>Nastavit</button> "
-            "<button name=go value=1>Nastavit a spustit</button></form>");
-
-  page += "<h2>WiFi</h2><p>" + net + "</p>";
-  page += F("<h2>Displej</h2><form method=post action=/rotate><button>Otočit o 180°</button></form>"
-            "<script>function st(){fetch('/settime?t='+Math.floor(Date.now()/1000))"
-            ".then(()=>location.replace('/'))}");
-  // bez internetu si hodiny vezmou cas z prohlizece hned pri otevreni stranky
-  if (!timeValid()) page += F("st();");
-  page += F("</script>");
-  server.send(200, "text/html; charset=utf-8", page);
-}
-
-void redirectHome() {
-  server.sendHeader("Location", "/");
-  server.send(303);
-}
-
-void handleSetTime() {
-  long long epoch = atoll(server.arg("t").c_str());
-  if (epoch < 1700000000LL || epoch > 4102444800LL) {
-    server.send(400, "text/plain", "neplatny cas");
-    return;
-  }
-  if (!ntpSynced) {
-    struct timeval tv = {(time_t)epoch, 0};
-    settimeofday(&tv, nullptr);
-    browserTimeSet = true;
-  }
-  server.send(200, "text/plain", "ok");
-}
-
-void handleTimer() {
-  long total = server.arg("m").toInt() * 60 + server.arg("s").toInt();
-  total = constrain(total, 1L, (long)(TIMER_MAX_MS / 1000));
-  stopAlarm();
-  setTimerTotal(total * 1000UL);
-  if (server.arg("go") == "1") countdown.toggle(nowMs());
-  setMode(Mode::Timer);
-  redirectHome();
-}
-
-void handleRotate() {
-  rotated = !rotated;
-  prefs.putBool("rot", rotated);
-  ui.setRotated(rotated);
-  redirectHome();
-}
-
-void webBegin() {
-  server.on("/", HTTP_GET, []() { sendPage(); });
-  server.on("/settime", HTTP_GET, handleSetTime);
-  server.on("/timer", HTTP_POST, handleTimer);
-  server.on("/rotate", HTTP_POST, handleRotate);
-  server.onNotFound(redirectHome);
-  server.begin();
 }
 
 // ---------------------------------------------------------------- seriova linka
@@ -465,15 +411,15 @@ void pollSerial(int64_t now) {
 }
 
 void printStatus(int64_t now) {
-  static const char *const MODES[] = {"hodiny", "stopky", "minutka"};
+  static const char *const MODES[] = {"hodiny", "stopky", "minutka", "pismo", "vypnout"};
   struct tm t;
   char clock[20] = "nenastaven";
   if (localNow(t)) strftime(clock, sizeof(clock), "%H:%M:%S", &t);
-  Serial.printf("[stav] beh=%llds reset=%d rezim=%s cas=%s stopky=%lld ms%s minutka=%lld/%lld ms%s wifi=%s ap=%d heap=%u\n",
-                now / 1000, (int)esp_reset_reason(), MODES[(int)mode], clock, stopwatch.elapsed(now),
+  Serial.printf("[stav] beh=%llds reset=%d pismo=%d rezim=%s cas=%s stopky=%lld ms%s minutka=%lld/%lld ms%s wifi=%s sync=%d heap=%u\n",
+                now / 1000, (int)esp_reset_reason(), (int)digitFont, MODES[(int)mode], clock, stopwatch.elapsed(now),
                 stopwatch.running ? " (bezi)" : "", countdown.remaining(now), countdown.totalMs,
                 alarmOn ? " (ALARM)" : countdown.running ? " (bezi)" : "",
-                WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "-", apOn,
+                wifiOn ? "zap" : "vyp", everSynced,
                 (unsigned)ESP.getFreeHeap());
 }
 
@@ -496,7 +442,6 @@ void setup() {
   setenv("TZ", TIMEZONE, 1);
   tzset();
   netBegin(nowMs());
-  webBegin();
   Serial.println("[start] hodiny bezi");
 }
 
@@ -514,12 +459,12 @@ void loop() {
   if (countdown.expired(now)) startAlarm(now);
   updateAlarm(now);
   autoReturnToClock(now);
+  autoPowerOff(now);
 
   if (now - lastNetAt >= 1000) {
     lastNetAt = now;
     netLoop(now);
   }
-  server.handleClient();
 
   if (now - lastDrawAt >= 20) {
     lastDrawAt = now;

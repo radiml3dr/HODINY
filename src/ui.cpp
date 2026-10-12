@@ -3,8 +3,22 @@
 #include <Arduino_GFX_Library.h>
 
 #include "config.h"
+#include "font_japan.h"
+#include "font_klingon.h"
 
 namespace {
+
+// Pismo z bitmap: 10 cislic za sebou, kazda w/8*h bajtu
+struct BitmapFont {
+  const uint8_t *big;
+  int16_t bigW, bigH;
+  const uint8_t *small;
+  int16_t smallW, smallH;
+};
+constexpr BitmapFont KLINGON_FONT = {KLINGON_BIG[0], KLINGON_BIG_W, KLINGON_BIG_H,
+                                     KLINGON_SMALL[0], KLINGON_SMALL_W, KLINGON_SMALL_H};
+constexpr BitmapFont JAPAN_FONT = {JAPAN_BIG[0], JAPAN_BIG_W, JAPAN_BIG_H,
+                                   JAPAN_SMALL[0], JAPAN_SMALL_W, JAPAN_SMALL_H};
 
 constexpr int16_t W = 320;
 
@@ -47,6 +61,23 @@ constexpr int16_t SEG_GAP = 2;
 // bity: A=1 B=2 C=4 D=8 E=16 F=32 G=64; posledni dve jsou pomlcka a prazdno
 constexpr uint8_t SEGMENTS[12] = {0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F, 0x40, 0x00};
 
+// Predatorska cislice je 7 car: svisla nahore, dve vodorovne a ctyri sikme do kosoctverce.
+// Souradnice jsou v promile oblasti znaku, bity masky v poradi tabulky.
+struct Stroke {
+  int16_t u0, v0, u1, v1;
+};
+constexpr Stroke PREDATOR_STROKES[7] = {
+    {500, 0, 500, 330},     // svisla
+    {0, 290, 330, 290},     // vodorovna leva
+    {670, 290, 1000, 290},  // vodorovna prava
+    {320, 385, 80, 636},    // horni leva /
+    {680, 385, 920, 636},   // horni prava \.
+    {80, 748, 320, 1000},   // dolni leva \.
+    {920, 748, 680, 1000},  // dolni prava /
+};
+// prevzato z fanouskovskeho fontu Predator (Giedi Prime); posledni dve jsou pomlcka a prazdno
+constexpr uint8_t PREDATOR_SEGMENTS[12] = {0x7F, 0x0F, 0x3F, 0x24, 0x3C, 0x6B, 0x78, 0x4B, 0x67, 0x79, 0x06, 0x00};
+
 Arduino_DataBus *bus = nullptr;
 Arduino_GFX *gfx = nullptr;
 
@@ -83,6 +114,19 @@ void Ui::begin(bool rotated) {
 
 void Ui::setRotated(bool rotated) {
   gfx->setRotation(rotated ? 3 : 1);
+  clear();
+}
+
+void Ui::sleep() {
+  // PWM se ve spanku zastavi, proto podsviceni natvrdo do nuly
+  ledcDetach(PIN_LCD_BL);
+  pinMode(PIN_LCD_BL, OUTPUT);
+  digitalWrite(PIN_LCD_BL, LOW);
+  gfx->displayOff();
+}
+
+void Ui::setFont(DigitFont font) {
+  font_ = font;
   clear();
 }
 
@@ -156,10 +200,10 @@ void Ui::layoutDigits(int16_t x0) {
   digitsX0_ = x0;
   gfx->fillRect(0, BIG_Y, W, BIG_H, color::BG);
   for (uint8_t i = 0; i < 4; i++) {
-    big_[i] = {(int16_t)(x0 + BIG_DX[i]), BIG_Y, BIG_W, BIG_H, BIG_T, 0, 0, false};
+    big_[i] = {(int16_t)(x0 + BIG_DX[i]), BIG_Y, BIG_W, BIG_H, BIG_T, 0, 0, 0, false};
   }
   for (uint8_t i = 0; i < 2; i++) {
-    small_[i] = {(int16_t)(x0 + SMALL_DX[i]), BIG_Y + BIG_H - SMALL_H, SMALL_W, SMALL_H, SMALL_T, 0, 0, false};
+    small_[i] = {(int16_t)(x0 + SMALL_DX[i]), BIG_Y + BIG_H - SMALL_H, SMALL_W, SMALL_H, SMALL_T, 0, 0, 0, false};
   }
   colonState_ = -1;
   dotState_ = -1;
@@ -189,17 +233,67 @@ void Ui::digits(const int8_t big[4], bool colonOn, const int8_t small[2], bool d
 }
 
 void Ui::drawSlot(Slot &s, int8_t value, uint16_t col) {
-  uint8_t mask = SEGMENTS[constrain(value, 0, DIGIT_BLANK)];
-  for (uint8_t seg = 0; seg < 7; seg++) {
-    bool on = mask & (1 << seg);
-    bool wasOn = s.mask & (1 << seg);
-    if (!s.valid || on != wasOn || (on && col != s.col)) {
-      drawSegment(s, seg, on ? col : color::SEG_OFF);
+  value = constrain(value, 0, DIGIT_BLANK);
+  uint8_t mask = 0;
+  if (font_ == DigitFont::Klingon || font_ == DigitFont::Japan) {
+    if (!s.valid || value != s.value || col != s.col) drawBitmapDigit(s, value, col);
+  } else {
+    bool predator = font_ == DigitFont::Predator;
+    mask = predator ? PREDATOR_SEGMENTS[value] : SEGMENTS[value];
+    for (uint8_t seg = 0; seg < 7; seg++) {
+      bool on = mask & (1 << seg);
+      bool wasOn = s.mask & (1 << seg);
+      if (!s.valid || on != wasOn || (on && col != s.col)) {
+        uint16_t c = on ? col : color::SEG_OFF;
+        if (predator) drawPredatorSegment(s, seg, c);
+        else drawSegment(s, seg, c);
+      }
     }
   }
   s.mask = mask;
+  s.value = value;
   s.col = col;
   s.valid = true;
+}
+
+// Predatorske znaky jsou skoro ctvercove, proto nezabiraji celou vysku mista
+void Ui::drawPredatorSegment(const Slot &s, uint8_t seg, uint16_t col) {
+  float r = s.t * 0.22f;
+  float areaH = s.h * 0.85f;
+  float left = s.x + r;
+  float top = s.y + (s.h - areaH) / 2 + r;
+  float spanX = (s.w - 1 - 2 * r) / 1000.0f;
+  float spanY = (areaH - 1 - 2 * r) / 1000.0f;
+  const Stroke &k = PREDATOR_STROKES[seg];
+  float x0 = left + k.u0 * spanX, y0 = top + k.v0 * spanY;
+  float x1 = left + k.u1 * spanX, y1 = top + k.v1 * spanY;
+
+  // tlusta cara jako ctyruhelnik ze dvou trojuhelniku
+  float len = sqrtf((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0));
+  float nx = -(y1 - y0) / len * r;
+  float ny = (x1 - x0) / len * r;
+  int16_t ax = lroundf(x0 + nx), ay = lroundf(y0 + ny);
+  int16_t bx = lroundf(x0 - nx), by = lroundf(y0 - ny);
+  int16_t cx = lroundf(x1 - nx), cy = lroundf(y1 - ny);
+  int16_t dx = lroundf(x1 + nx), dy = lroundf(y1 + ny);
+  gfx->fillTriangle(ax, ay, bx, by, cx, cy, col);
+  gfx->fillTriangle(ax, ay, cx, cy, dx, dy, col);
+}
+
+void Ui::drawBitmapDigit(const Slot &s, int8_t value, uint16_t col) {
+  const BitmapFont &f = font_ == DigitFont::Japan ? JAPAN_FONT : KLINGON_FONT;
+  bool big = s.h == BIG_H;
+  int16_t w = big ? f.bigW : f.smallW;
+  int16_t h = big ? f.bigH : f.smallH;
+  int16_t x = s.x + (s.w - w) / 2;
+  int16_t y = s.y + (s.h - h) / 2;
+  if (value <= 9) {
+    const uint8_t *glyphs = big ? f.big : f.small;
+    gfx->drawBitmap(x, y, glyphs + value * (w / 8 * h), w, h, col, color::BG);
+    return;
+  }
+  gfx->fillRect(x, y, w, h, color::BG);
+  if (value == DIGIT_DASH) gfx->fillRect(x + w / 4, y + h / 2 - s.t / 4, w / 2, s.t / 2, col);
 }
 
 void Ui::drawSegment(const Slot &s, uint8_t seg, uint16_t col) {

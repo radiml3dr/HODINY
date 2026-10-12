@@ -19,6 +19,10 @@ constexpr uint16_t DIM = rgb(70, 70, 70);
 constexpr int8_t DIGIT_DASH = 10;
 constexpr int8_t DIGIT_BLANK = 11;
 
+// Pismo velkych cislic: sedmisegmentovky, klingonske pIqaD, znaky z predatorova odpoctu, japonske kandzi.
+enum class DigitFont : uint8_t { Latin, Klingon, Predator, Japan };
+constexpr uint8_t DIGIT_FONT_COUNT = 4;
+
 // Kresleni na displej 320x172 na sirku. Vsechno si pamatuje, co uz je nakreslene,
 // a prekresluje jen zmeny, takze nic neblika.
 class Ui {
@@ -28,6 +32,8 @@ class Ui {
 
   void begin(bool rotated);
   void setRotated(bool rotated);
+  void setFont(DigitFont font);
+  void sleep();  // zhasne podsviceni a uspi radic displeje; probudi ho az restart
   void clear();
   void invert(bool on);
 
@@ -43,6 +49,7 @@ class Ui {
     int16_t x, y, w, h;
     uint8_t t;
     uint8_t mask;
+    int8_t value;
     uint16_t col;
     bool valid;
   };
@@ -57,9 +64,12 @@ class Ui {
   void drawSegment(const Slot &s, uint8_t seg, uint16_t col);
   void hseg(int16_t xa, int16_t xb, int16_t cy, int16_t half, uint16_t col);
   void vseg(int16_t cx, int16_t ya, int16_t yb, int16_t half, uint16_t col);
+  void drawPredatorSegment(const Slot &s, uint8_t seg, uint16_t col);
+  void drawBitmapDigit(const Slot &s, int8_t value, uint16_t col);
   bool changed(TextCache &c, const String &text, uint16_t col);
   void print(int16_t x, int16_t y, const String &text, uint16_t col);
 
+  DigitFont font_ = DigitFont::Latin;
   Slot big_[4] = {};
   Slot small_[2] = {};
   int16_t digitsX0_ = -1;
