@@ -102,6 +102,7 @@ String padCenter(const String &s, uint8_t n) {
 }  // namespace
 
 void Ui::begin(bool rotated) {
+  rotated_ = rotated;
   bus = new Arduino_HWSPI(PIN_LCD_DC, PIN_LCD_CS, PIN_LCD_SCLK, PIN_LCD_MOSI);
   // panel 172x320 je v pameti radice posunuty o 34 sloupcu
   gfx = new Arduino_ST7789(bus, PIN_LCD_RST, rotated ? 3 : 1, true, 172, 320, 34, 0, 34, 0);
@@ -113,9 +114,17 @@ void Ui::begin(bool rotated) {
 }
 
 void Ui::setRotated(bool rotated) {
+  rotated_ = rotated;
   gfx->setRotation(rotated ? 3 : 1);
   clear();
 }
+
+void Ui::setPortrait(bool portrait) {
+  gfx->setRotation(portrait ? (rotated_ ? 2 : 0) : (rotated_ ? 3 : 1));
+  clear();
+}
+
+Arduino_GFX *Ui::display() { return gfx; }
 
 void Ui::sleep() {
   // PWM se ve spanku zastavi, proto podsviceni natvrdo do nuly

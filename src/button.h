@@ -40,6 +40,8 @@ class Button {
     return BtnEvent::None;
   }
 
+  bool down() const { return down_; }  // tlacitko je prave stisknute (po odruseni zakmitu)
+
   // Okamzik skutecneho stisku, aby stopky nemerily zpozdeni o debounce a pusteni
   int64_t pressedAt() const { return pressedAt_; }
 

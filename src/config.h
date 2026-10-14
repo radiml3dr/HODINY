@@ -36,6 +36,7 @@ constexpr uint32_t TIMER_MAX_MS = (99 * 60 + 59) * 1000;
 // Navrat na hodiny, kdyz se nic nedeje: minutka neodpocitava, stopky stoji
 constexpr uint32_t TIMER_IDLE_RETURN_MS = 30 * 1000;
 constexpr uint32_t STOPWATCH_IDLE_RETURN_MS = 5 * 60 * 1000;
+constexpr uint32_t GAME_IDLE_RETURN_MS = 60 * 1000;  // hra, kdyz se nehraje
 
 constexpr uint32_t ALARM_DURATION_MS = 60 * 1000;
 

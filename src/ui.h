@@ -1,6 +1,8 @@
 #pragma once
 #include <Arduino.h>
 
+class Arduino_GFX;
+
 constexpr uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
   return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
 }
@@ -32,6 +34,8 @@ class Ui {
 
   void begin(bool rotated);
   void setRotated(bool rotated);
+  void setPortrait(bool portrait);  // na vysku pro hru, zpet na sirku
+  Arduino_GFX *display();
   void setFont(DigitFont font);
   void sleep();  // zhasne podsviceni a uspi radic displeje; probudi ho az restart
   void clear();
@@ -69,6 +73,7 @@ class Ui {
   bool changed(TextCache &c, const String &text, uint16_t col);
   void print(int16_t x, int16_t y, const String &text, uint16_t col);
 
+  bool rotated_ = false;
   DigitFont font_ = DigitFont::Latin;
   Slot big_[4] = {};
   Slot small_[2] = {};

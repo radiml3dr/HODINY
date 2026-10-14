@@ -1,4 +1,4 @@
-// Hodiny, stopky a minutka pro LAFVIN ESP32-C6 s 1,47" displejem.
+// Hodiny, stopky, minutka a hra River Raid pro LAFVIN ESP32-C6 s 1,47" displejem.
 // Ovladani jednim tlacitkem BOOT: klik, dvojklik, podrzeni (dalsi rezim).
 
 #include <Arduino.h>
@@ -11,12 +11,13 @@
 
 #include "button.h"
 #include "config.h"
+#include "riverraid.h"
 #include "timing.h"
 #include "ui.h"
 
 namespace {
 
-enum class Mode { Clock, Stopwatch, Timer, Font, Off };
+enum class Mode { Clock, Stopwatch, Timer, Game, Font, Off };
 
 Ui ui;
 Button button;
@@ -29,6 +30,7 @@ int64_t lastActivityAt = 0;  // posledni stisk nebo zmena rezimu, pro navrat na 
 int64_t lastBusyAt = 0;      // posledni stisk nebo bezici mereni, pro samocinne vypnuti
 bool autoOffEnabled = true;  // setreni jde zrusit na obrazovce VYPNOUT; plati do restartu
 int64_t pendingOffAt = 0;    // klik na VYPNOUT ceka, jestli z nej nebude dvojklik
+int64_t pendingGameAt = 0;   // klik na hru ceka, jestli z nej nebude dvojklik (simulace)
 bool showInfo = false;
 bool rotated = false;
 DigitFont digitFont = DigitFont::Latin;
@@ -93,11 +95,19 @@ void nextPreset() {
 }
 
 void setMode(Mode m) {
+  // hra je na vysku, ostatni rezimy na sirku
+  if (mode == Mode::Game && m != Mode::Game) ui.setPortrait(false);
+  bool enterGame = m == Mode::Game && mode != Mode::Game;
   mode = m;
   showInfo = false;
   pendingOffAt = 0;
+  pendingGameAt = 0;
   lastActivityAt = nowMs();
   ui.clear();
+  if (enterGame) {
+    ui.setPortrait(true);
+    riverraid::enter();
+  }
 }
 
 void startAlarm(int64_t now) {
@@ -165,7 +175,7 @@ void autoPowerOff(int64_t now) {
     }
   }
   if (!autoOffEnabled) return;
-  if (countdown.running || stopwatch.running || alarmOn) lastBusyAt = now;
+  if (countdown.running || stopwatch.running || alarmOn || (mode == Mode::Game && riverraid::busy())) lastBusyAt = now;
   if (now - lastBusyAt < AUTO_OFF_MS) return;
   if (HWCDC::isPlugged()) {
     // u pocitace se nevypina; odklad, at se stav USB necte v kazdem pruchodu smycky
@@ -181,7 +191,8 @@ void autoReturnToClock(int64_t now) {
   bool timerIdle = mode == Mode::Timer && !countdown.running && !alarmOn && idle >= TIMER_IDLE_RETURN_MS;
   bool stopwatchIdle = mode == Mode::Stopwatch && !stopwatch.running && idle >= STOPWATCH_IDLE_RETURN_MS;
   bool fontIdle = (mode == Mode::Font || mode == Mode::Off) && idle >= TIMER_IDLE_RETURN_MS;
-  if (timerIdle || stopwatchIdle || fontIdle) setMode(Mode::Clock);
+  bool gameIdle = mode == Mode::Game && !riverraid::busy() && idle >= GAME_IDLE_RETURN_MS;
+  if (timerIdle || stopwatchIdle || fontIdle || gameIdle) setMode(Mode::Clock);
 }
 
 void onButton(BtnEvent ev, int64_t at) {
@@ -192,8 +203,10 @@ void onButton(BtnEvent ev, int64_t at) {
     timerIdleBeforeClick = false;  // pripadny druhy klik uz nema prepnout predvolbu
     return;
   }
+  // za rucni hry tlacitko ridi letadlo (hra si ho cte sama), rezim se prepina az mimo hru
+  if (mode == Mode::Game && !riverraid::acceptsMenuInput(at)) return;
   if (ev == BtnEvent::LongPress) {
-    setMode(mode == Mode::Clock ? Mode::Stopwatch : mode == Mode::Stopwatch ? Mode::Timer : mode == Mode::Timer ? Mode::Font : mode == Mode::Font ? Mode::Off : Mode::Clock);
+    setMode(mode == Mode::Clock ? Mode::Stopwatch : mode == Mode::Stopwatch ? Mode::Timer : mode == Mode::Timer ? Mode::Game : mode == Mode::Game ? Mode::Font : mode == Mode::Font ? Mode::Off : Mode::Clock);
     return;
   }
   switch (mode) {
@@ -204,6 +217,17 @@ void onButton(BtnEvent ev, int64_t at) {
         autoOffEnabled = !autoOffEnabled;
         Serial.printf("[spanek] setreni %s\n", autoOffEnabled ? "zapnuto" : "zruseno");
         setMode(Mode::Clock);
+      }
+      break;
+
+    case Mode::Game:
+      if (riverraid::demo()) {
+        if (ev == BtnEvent::Click) riverraid::enter();  // klik ukonci simulaci
+      } else if (ev == BtnEvent::Click) {
+        pendingGameAt = nowMs() + 400;
+      } else {
+        pendingGameAt = 0;
+        riverraid::start(true);
       }
       break;
 
@@ -354,6 +378,7 @@ void drawOff() {
 void draw(int64_t now) {
   switch (mode) {
     case Mode::Off: drawOff(); break;
+    case Mode::Game: break;  // hra kresli sama
     case Mode::Font: drawFont(); break;
     case Mode::Clock:
       if (showInfo) drawInfo();
@@ -430,7 +455,7 @@ void pollSerial(int64_t now) {
 }
 
 void printStatus(int64_t now) {
-  static const char *const MODES[] = {"hodiny", "stopky", "minutka", "pismo", "vypnout"};
+  static const char *const MODES[] = {"hodiny", "stopky", "minutka", "hra", "pismo", "vypnout"};
   struct tm t;
   char clock[20] = "nenastaven";
   if (localNow(t)) strftime(clock, sizeof(clock), "%H:%M:%S", &t);
@@ -457,6 +482,7 @@ void setup() {
 
   button.begin(PIN_BUTTON);
   ui.begin(rotated);
+  riverraid::begin(ui.display(), &prefs);
 
   setenv("TZ", TIMEZONE, 1);
   tzset();
@@ -485,7 +511,15 @@ void loop() {
     netLoop(now);
   }
 
-  if (now - lastDrawAt >= 20) {
+  if (mode == Mode::Game) {
+    // klik spusti hru, az kdyz je jiste, ze nejde o dvojklik na simulaci
+    if (pendingGameAt && now >= pendingGameAt && !button.down()) {
+      pendingGameAt = 0;
+      riverraid::start(false);
+    }
+    riverraid::loop(now, button.down());
+    if (riverraid::busy()) lastActivityAt = now;
+  } else if (now - lastDrawAt >= 20) {
     lastDrawAt = now;
     draw(now);
   }
